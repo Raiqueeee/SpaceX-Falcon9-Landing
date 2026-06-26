@@ -145,7 +145,6 @@ MUJOCO_LOG.TXT
 
 # Training artifacts
 training/checkpoints/
-videos/
 env/xml_files/multi_rocket_*.xml
 
 # uv
