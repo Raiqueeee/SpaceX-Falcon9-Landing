@@ -3,7 +3,7 @@
 A physics-accurate rocket landing simulation with two control approaches: a **reinforcement learning agent** trained with PPO and a **deterministic classical controller** modelled on the real Falcon 9 flight computer. Both controllers operate a 6-DOF MuJoCo rocket from altitude to a precision pad landing.
 
 <p align="center">
-  <img src="docs/rocket_preview.png" width="680" alt="Falcon 9 landing simulation">
+  <img src="docs/demo.gif" width="680" alt="Falcon 9 classical controller landing">
 </p>
 
 ---
