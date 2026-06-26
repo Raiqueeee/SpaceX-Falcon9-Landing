@@ -1,8 +1,9 @@
-"""PPO training with GPU-parallel MuJoCo Warp environments.
+"""PPO training with batched MuJoCo environments.
 
-On-policy training: collect large batches from thousands of parallel envs,
-compute GAE advantages, then do mini-batch PPO updates. Everything stays on GPU.
+On-policy training: collect large batches from parallel envs,
+compute GAE advantages, then do mini-batch PPO updates. Runs on CPU.
 """
+import glob
 import os
 import time
 from collections import defaultdict
@@ -14,7 +15,6 @@ _ORIGINAL_CWD = os.getcwd()
 
 import numpy as np
 import torch
-import torch.cuda
 import tqdm
 import wandb
 from tensordict import TensorDict
@@ -45,6 +45,24 @@ CRASH_REPORT_NAMES = {
 }
 
 
+def _find_latest_checkpoint(checkpoint_dir: str):
+    """Return the path of the checkpoint with the most collected frames, or None."""
+    best_path, best_frames = None, -1
+    for p in glob.glob(os.path.join(checkpoint_dir, "ppo_eval_*.pt")):
+        try:
+            frames = int(os.path.splitext(os.path.basename(p))[0].rsplit("_", 1)[-1])
+            if frames > best_frames:
+                best_frames, best_path = frames, p
+        except (ValueError, IndexError):
+            pass
+    # Prefer ppo_final.pt if it is newer than the best eval checkpoint
+    final = os.path.join(checkpoint_dir, "ppo_final.pt")
+    if os.path.exists(final):
+        if best_path is None or os.path.getmtime(final) >= os.path.getmtime(best_path):
+            return final
+    return best_path
+
+
 def aggregate_crash_stats(crash_reports):
     """Aggregate crash report statistics from a batch of episodes."""
     stats = defaultdict(int)
@@ -61,12 +79,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     project_root = os.path.abspath(os.path.join(script_dir, ".."))
     os.chdir(project_root)
 
-    device = cfg.network.device
-    if device in ("", None):
-        if torch.cuda.is_available():
-            device = torch.device("cuda:0")
-        else:
-            device = torch.device("cpu")
+    device = cfg.network.device or "cpu"
     device = torch.device(device)
 
     # Create logger
@@ -146,17 +159,41 @@ def main(cfg: "DictConfig"):  # noqa: F821
     checkpoint_dir = os.path.join(script_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # Precompute loop constants
-    num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
+    # --- Auto-resume from latest checkpoint ---
+    collected_frames = 0
+    num_network_updates = 0
+    resume_path = _find_latest_checkpoint(checkpoint_dir)
+    if resume_path:
+        torchrl_logger.info(f"Auto-resuming from: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        actor.load_state_dict(ckpt["actor_state_dict"])
+        critic.load_state_dict(ckpt["critic_state_dict"])
+        if "optim_state_dict" in ckpt:
+            optim.load_state_dict(ckpt["optim_state_dict"])
+        collected_frames = ckpt.get("collected_frames", 0)
+        num_network_updates = ckpt.get("num_network_updates", 0)
+        torchrl_logger.info(f"Resumed at {collected_frames:,} frames ({num_network_updates:,} updates)")
+    else:
+        torchrl_logger.info("No checkpoint found — starting fresh")
+
+    # If the previous run already finished, train for that many more frames
+    total_frames = cfg.collector.total_frames
+    if collected_frames >= total_frames:
+        total_frames = collected_frames + cfg.collector.total_frames
+        torchrl_logger.info(
+            f"Previous target reached. Training {cfg.collector.total_frames:,} more frames "
+            f"(target → {total_frames:,})."
+        )
+
+    # Precompute loop constants (use total_frames so annealing is correct on resume)
+    frames_per_batch = cfg.collector.frames_per_batch
+    num_mini_batches = frames_per_batch // cfg.loss.mini_batch_size
     total_network_updates = (
-        (cfg.collector.total_frames // cfg.collector.frames_per_batch)
-        * cfg.loss.ppo_epochs
-        * num_mini_batches
+        (total_frames // frames_per_batch) * cfg.loss.ppo_epochs * num_mini_batches
     )
     ppo_epochs = cfg.loss.ppo_epochs
     max_grad_norm = cfg.loss.max_grad_norm
     eval_iter = cfg.logger.eval_iter
-    frames_per_batch = cfg.collector.frames_per_batch
     eval_rollout_steps = cfg.env.max_episode_steps
     anneal_lr = cfg.loss.anneal_lr
     anneal_clip_epsilon = cfg.loss.anneal_clip_epsilon
@@ -166,9 +203,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
     # Main loop
     start_time = time.time()
-    collected_frames = 0
-    num_network_updates = 0
-    pbar = tqdm.tqdm(total=cfg.collector.total_frames)
+    pbar = tqdm.tqdm(total=total_frames, initial=collected_frames)
     batch_crash_reports = []
 
     losses = TensorDict(batch_size=[ppo_epochs, num_mini_batches])
@@ -176,7 +211,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     # Reset env once; auto-reset handles episode boundaries internally
     td = train_env.reset()
 
-    while collected_frames < cfg.collector.total_frames:
+    while collected_frames < total_frames:
         # --- Collect rollout by stepping env directly ---
         collect_start = time.time()
         rollout_tds = []
@@ -237,7 +272,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         # --- PPO training ---
         training_start = time.time()
         for j in range(ppo_epochs):
-            # Compute GAE advantages (all on GPU, no grad)
+            # Compute GAE advantages (no grad)
             with torch.no_grad():
                 data = adv_module(data)
 
@@ -336,7 +371,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
             torch.save({
                 "actor_state_dict": actor.state_dict(),
                 "critic_state_dict": critic.state_dict(),
+                "optim_state_dict": optim.state_dict(),
                 "collected_frames": collected_frames,
+                "num_network_updates": num_network_updates,
                 "config": dict(cfg),
             }, ckpt_path)
             torchrl_logger.info(f"Saved checkpoint: {ckpt_path}")
@@ -349,7 +386,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
     torch.save({
         "actor_state_dict": actor.state_dict(),
         "critic_state_dict": critic.state_dict(),
+        "optim_state_dict": optim.state_dict(),
         "collected_frames": collected_frames,
+        "num_network_updates": num_network_updates,
         "config": dict(cfg),
     }, final_ckpt_path)
     torchrl_logger.info(f"Saved final checkpoint: {final_ckpt_path}")

@@ -9,14 +9,13 @@ Train a reinforcement learning agent to land a rocket on a drone ship, SpaceX Fa
 ## Features
 
 - **MuJoCo physics** with 6-DOF free joint rocket dynamics
-- **GPU-accelerated training** via MuJoCo Warp (4096 parallel envs, ~1M+ steps/sec)
 - **PPO** (Proximal Policy Optimization) with GAE advantages
 - **Domain randomization** for robust policies
 - **Demo video renderer** with aerial and tracking camera angles
 
 ## Installation
 
-Requires Python 3.10+ and an NVIDIA GPU for training.
+Requires Python 3.10+. Runs on CPU — no GPU required.
 
 ```bash
 # Clone and install dependencies
@@ -24,20 +23,14 @@ git clone https://github.com/BY571/SpaceX-Falcon9.git
 cd SpaceX-Falcon9
 uv sync
 
-# For GPU training (MuJoCo Warp)
-uv sync --extra gpu
-
 # Activate environment
-source .venv/bin/activate
-
-# Required environment variables for MuJoCo rendering
-export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
-export MUJOCO_GL=egl
+source .venv/bin/activate  # Linux/macOS
+# or: .venv\Scripts\activate  # Windows
 ```
 
 ## Training
 
-PPO training with 4096 parallel GPU environments:
+PPO training on CPU:
 
 ```bash
 cd training && python train_ppo.py

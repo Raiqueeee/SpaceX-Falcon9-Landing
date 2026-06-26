@@ -55,15 +55,18 @@ class DomainRandomizationConfig:
 class RewardWeights:
     """Weights for different reward components.
 
-    Exponential shaping: all per-step components in [0, 1], weights sum to 1.0.
+    Exponential shaping: per-step components in [0, 1].
+    distance rewards low altitude + pad alignment.
+    time_penalty is subtracted every step to punish hovering.
     """
-    distance: float = 0.7
+    distance: float = 0.5    # altitude + horizontal alignment
     velocity: float = 0.15
-    upright: float = 0.1
-    angular: float = 0.05
-    success: float = 100.0
-    crash: float = -10.0
-    tipover: float = -10.0
+    upright: float = 0.08
+    angular: float = 0.02
+    success: float = 5000.0
+    crash: float = -50.0
+    tipover: float = -30.0
+    time_penalty: float = 0.0  # per-step cost; set via config to discourage hovering
 
 
 @dataclass

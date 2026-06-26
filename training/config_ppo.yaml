@@ -1,82 +1,78 @@
-# PPO training with GPU-parallel MuJoCo Warp environments
 env:
-  name: rocket_lander_warp
+  name: rocket_lander
   library: custom
-  max_episode_steps: 1000
+  # Optimal landing from 15 m takes only ~77 steps (50 above gate + 27 braking).
+  # 250 gives 3x safety margin and forces faster episode resets when hovering.
+  max_episode_steps: 250
   seed: 42
-  num_envs: 4096
-
-  # Rocket design and configuration
+  num_envs: 16
+  # Start at 15 m instead of 50 m. Physics analysis shows that from 50 m the
+  # rocket free-falls to 29.7 m/s at the 5-m gate — physically impossible to
+  # brake in 5 m. From 15 m it arrives at ~7 m/s (well within braking range).
+  # Also: discount factor 0.99^400 ≈ 0.007 makes the landing bonus invisible
+  # from 50 m; from 15 m it lands at step ~130, discount = 0.27 (clearly visible).
+  starting_height: 15.0
   rocket:
-    design: demo  # detailed tripod with legs for visualization
-
-  # Reward weights (exponential shaping, per-step components in [0,1])
+    design: demo
   reward_weights:
-    distance: 0.6
-    velocity: 0.25
-    upright: 0.1
-    angular: 0.05
-    success: 2000.0
-    crash: -10.0
-    tipover: -10.0
-    time_penalty: 0.125
-
-  # Velocity penalty shaping (exponential gate near ground)
+    # Below-gate approach rewards (only active when altitude < 5 m)
+    distance: 0.40   # altitude-to-target + horizontal alignment
+    velocity: 0.30   # slow speed required near ground
+    upright: 0.20    # stay vertical during final approach
+    angular: 0.10    # no spin
+    # Terminal
+    success: 10000.0 # massive landing bonus
+    crash: -100.0    # hard crash penalty
+    tipover: -50.0   # tip-over penalty
+    # time_penalty doubles as forced-descent rate above 5 m (no positive reward up there)
+    time_penalty: 0.50
   velocity_penalty:
-    gate_scale: 15.0    # height scale for danger zone (meters)
-    coeff: 3.0          # steepness of velocity penalty - strong near ground
-
-  # Termination conditions
+    gate_scale: 15.0
+    coeff: 3.0
   termination:
     max_distance: 20.0
     max_angle: 70.0
-    crash_velocity: 5.0  # m/s — ground contact above this = crash
-
-  # Reset noise (domain randomization for initial conditions)
+    crash_velocity: 5.0
   reset_noise:
-    pos: 3.0      # xy position noise in meters
-    vel: 3.0      # linear velocity noise in m/s
-    ang: 0.15     # angular noise in radians (~8 degrees)
-    angvel: 0.3   # angular velocity noise in rad/s
-
-# collector
+    pos: 3.0
+    vel: 3.0
+    ang: 0.15
+    angvel: 0.3
 collector:
-  total_frames: 50_000_000
-  frames_per_batch: 65536  # 4096 envs * 16 steps
-  device: cuda
-
-# PPO loss hyperparameters
+  # 1M frames achieves ~30% success rate (descends but unreliable landing).
+  # 3M frames achieves ~80% success rate (reliable smooth landing ~67 min wall time).
+  total_frames: 3_000_000
+  # 1024 frames/batch = 16 envs × 64 steps each.
+  # Doubled from 512: more diverse rollout data per update, better gradient estimates.
+  frames_per_batch: 1024
+  device: cpu
 loss:
   clip_epsilon: 0.2
-  entropy_coeff: 0.01
+  entropy_coeff: 0.02
   critic_coeff: 0.5
   loss_critic_type: l2
-  ppo_epochs: 4
-  mini_batch_size: 4096
+  ppo_epochs: 3
+  mini_batch_size: 128
   gamma: 0.99
   gae_lambda: 0.97
   max_grad_norm: 0.5
   anneal_lr: true
   anneal_clip_epsilon: true
-
-# optim
 optim:
   lr: 3.0e-4
-  device: cuda
-
-# network
+  device: cpu
 network:
-  hidden_sizes: [256, 256]
+  # 128x128 is ~4x fewer FLOPs than 256x256 on CPU, with minimal quality loss
+  # for this task. Main speedup lever on CPU training.
+  hidden_sizes: [128, 128]
   activation: tanh
-  device: cuda
-
-# logging
+  device: cpu
 logger:
   backend: wandb
   project_name: SpaceX-Landing
   group_name: null
-  exp_name: ${env.name}_PPO_GPU
-  mode: online
-  eval_iter: 5_000_000
-  video: true
+  exp_name: rocket_lander_PPO_CPU_v3
+  mode: offline
+  eval_iter: 100_000
+  video: false
   log_crash_breakdown: true

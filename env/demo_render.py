@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from tensordict.nn import AddStateIndependentNormalScale, TensorDictModule
 from torchrl.envs import GymWrapper, TransformedEnv, Compose
-from torchrl.envs.transforms import DoubleToFloat, InitTracker, RewardSum, StepCounter
+from torchrl.envs.transforms import DoubleToFloat, InitTracker, ObservationNorm, RewardSum, StepCounter
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import MLP, ProbabilisticActor
 from torchrl.modules.distributions import TanhNormal
@@ -29,6 +29,12 @@ from torchrl.modules.distributions import TanhNormal
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+# Must match OBS_SCALE in training/utils_ppo.py
+_OBS_SCALE = torch.tensor(
+    [20., 20., 15., 90., 90., 180., 15., 15., 15., 10., 10., 10.],
+    dtype=torch.float32,
+)
 
 from env.rocket_landing import RocketLander
 
@@ -54,6 +60,12 @@ def build_env(rocket_design, curriculum_height=None, max_episode_steps=1000):
             StepCounter(max_steps=max_episode_steps),
             InitTracker(),
             DoubleToFloat(),
+            ObservationNorm(
+                in_keys=["observation"],
+                loc=torch.zeros(12, dtype=torch.float32),
+                scale=_OBS_SCALE,
+                standard_normal=True,
+            ),
             RewardSum(),
         ),
     )
@@ -105,13 +117,16 @@ def build_ppo_actor(env, hidden_sizes, activation, device):
     return actor
 
 
-def collect_trajectory(env, rocket_env, actor, max_steps, linger_steps=60):
+def collect_trajectory(env, rocket_env, actor, max_steps, linger_steps=240):
     """Step the policy and record qpos/qvel at each timestep.
 
-    After episode ends, continues recording for linger_steps frames
-    so the video doesn't cut off abruptly on landing.
+    Returns (trajectory, final_altitude, landed) where landed=True if the
+    episode ended with crash_report==1 (successful landing).
     """
     trajectory = []
+    landed = False
+    final_alt = float("inf")
+
     with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
         td = env.reset()
         for _ in range(max_steps):
@@ -121,17 +136,46 @@ def collect_trajectory(env, rocket_env, actor, max_steps, linger_steps=60):
             qpos = rocket_env.data.qpos.copy()
             qvel = rocket_env.data.qvel.copy()
             trajectory.append((qpos, qvel))
+            final_alt = float(qpos[2])
 
             done = td["next", "done"].item()
             if done:
-                # Keep recording physics for a bit after landing
+                # Check if we actually landed (crash_report == 1)
+                if ("next", "crash_report") in td.keys(True):
+                    landed = int(td["next", "crash_report"].item()) == 1
                 for _ in range(linger_steps):
                     mujoco.mj_step(rocket_env.model, rocket_env.data)
                     trajectory.append((rocket_env.data.qpos.copy(), rocket_env.data.qvel.copy()))
                 break
             td = td["next"]
 
-    return trajectory
+    return trajectory, final_alt, landed
+
+
+def collect_best_trajectory(env, rocket_env, actor, max_steps, linger_steps=240, attempts=1):
+    """Run the policy `attempts` times and return the trajectory with the lowest final altitude.
+
+    Prefers successful landings (crash_report==1) over close-but-not-landed attempts.
+    """
+    best_traj, best_alt, best_landed = None, float("inf"), False
+
+    for i in range(attempts):
+        traj, final_alt, landed = collect_trajectory(env, rocket_env, actor, max_steps, linger_steps)
+        status = "LANDED" if landed else f"alt={final_alt:.1f}m"
+        print(f"  Attempt {i + 1}/{attempts}: {status}")
+
+        if best_traj is None:
+            best_traj, best_alt, best_landed = traj, final_alt, landed
+            continue
+
+        # Prefer a successful landing over a lower final altitude from a crash
+        if landed and not best_landed:
+            best_traj, best_alt, best_landed = traj, final_alt, landed
+        elif not landed and not best_landed and final_alt < best_alt:
+            best_traj, best_alt, best_landed = traj, final_alt, landed
+
+    print(f"  Best: {'LANDED' if best_landed else f'alt={best_alt:.1f}m'}")
+    return best_traj
 
 
 def make_camera(lookat, distance, azimuth, elevation):
@@ -205,8 +249,10 @@ def main():
     parser = argparse.ArgumentParser(description="Render demo videos from a trained PPO checkpoint")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to PPO checkpoint .pt file")
     parser.add_argument("--resolution", type=int, default=1080, help="Video height in pixels (default: 1080)")
-    parser.add_argument("--fps", type=int, default=40, help="Video FPS (default: 40)")
+    parser.add_argument("--fps", type=int, default=24, help="Video FPS (default: 24, lower = longer video)")
     parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
+    parser.add_argument("--linger", type=int, default=240, help="Extra frames to record after landing (default: 240)")
+    parser.add_argument("--attempts", type=int, default=3, help="Number of rollouts to try; best (lowest altitude) is rendered (default: 3)")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory (default: videos/)")
     parser.add_argument("--rocket-design", type=str, default=None, help="Override rocket design (v0/v1)")
     parser.add_argument("--height", type=float, default=None, help="Override starting height")
@@ -256,10 +302,13 @@ def main():
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
 
-    # Collect trajectory
-    print("\nCollecting trajectory...")
-    trajectory = collect_trajectory(env, rocket_env, actor, args.max_steps)
-    print(f"  Collected {len(trajectory)} steps")
+    # Collect trajectory — run multiple attempts and pick the one that gets closest to landing
+    print(f"\nCollecting trajectory ({args.attempts} attempt(s))...")
+    trajectory = collect_best_trajectory(
+        env, rocket_env, actor, args.max_steps,
+        linger_steps=args.linger, attempts=args.attempts,
+    )
+    print(f"  Total frames recorded: {len(trajectory)}")
 
     if trajectory:
         final_pos = trajectory[-1][0][:3]

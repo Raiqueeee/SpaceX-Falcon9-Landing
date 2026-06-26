@@ -1,12 +1,12 @@
-"""GPU-accelerated batched rocket landing environment using MuJoCo Warp.
+"""Batched rocket landing environment using MuJoCo Warp.
 
-Runs thousands of parallel rocket simulations on GPU via NVIDIA Warp,
-with observation/reward/done logic in pure PyTorch for zero-copy GPU training.
+Runs parallel rocket simulations via NVIDIA Warp (GPU when available, CPU fallback),
+with observation/reward/done logic in pure PyTorch.
 
 Usage with TorchRL:
-    env = RocketLanderWarp(num_envs=4096, device="cuda")
+    env = RocketLanderWarp(num_envs=64, device="cpu")
     td = env.reset()
-    td = env.step(td)  # steps all 4096 environments at once
+    td = env.step(td)  # steps all environments at once
 """
 
 import os
@@ -29,10 +29,7 @@ from env.config import ROCKET_DESIGNS
 
 
 def _quat_to_euler_batch(quat):
-    """Convert batched quaternions [N, 4] (w,x,y,z) to euler angles [N, 3] in degrees.
-
-    Pure PyTorch, runs on GPU.
-    """
+    """Convert batched quaternions [N, 4] (w,x,y,z) to euler angles [N, 3] in degrees."""
     w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
 
     # Roll
@@ -57,9 +54,9 @@ def _quat_to_euler_batch(quat):
 
 
 class RocketLanderWarp(EnvBase):
-    """Batched GPU rocket landing environment using MuJoCo Warp.
+    """Batched rocket landing environment using MuJoCo Warp.
 
-    All N environments step simultaneously on GPU. Observation, reward,
+    All N environments step simultaneously. Observation, reward,
     and termination logic are computed in batched PyTorch ops.
     """
 
@@ -67,7 +64,7 @@ class RocketLanderWarp(EnvBase):
         self,
         num_envs: int = 4096,
         rocket_design: str = "v0",
-        device: str = "cuda",
+        device: str = "cpu",
         max_episode_steps: int = 1000,
         frame_skip: int = 5,
         starting_height: float = 50.0,
@@ -149,19 +146,18 @@ class RocketLanderWarp(EnvBase):
         self._vel_history = torch.zeros(num_envs, self._vel_history_len, device=self._device)
         self._vel_history_idx = 0
 
-        # Capture CUDA graph for fast stepping
+        # Capture CUDA graph for fast stepping (GPU only; falls back to direct stepping on CPU)
         self._graph = None
-        self._capture_cuda_graph()
+        if torch.cuda.is_available():
+            self._capture_cuda_graph()
 
         super().__init__(device=self._device, batch_size=torch.Size([num_envs]))
         self._make_spec()
 
     def _capture_cuda_graph(self):
-        """Capture a CUDA graph for the step function for maximum throughput."""
-        # Warm up
+        """Capture a CUDA graph for the step function for maximum throughput (GPU only)."""
         mjw.step(self._mjw_model, self._mjw_data)
         wp.synchronize()
-        # Capture
         with wp.ScopedCapture() as capture:
             for _ in range(self._frame_skip):
                 mjw.step(self._mjw_model, self._mjw_data)
@@ -427,8 +423,12 @@ class RocketLanderWarp(EnvBase):
         ctrl = self._warp_to_torch(self._mjw_data.ctrl)
         ctrl.copy_(actions)
 
-        # Step physics (frame_skip steps via CUDA graph)
-        wp.capture_launch(self._graph)
+        # Step physics (frame_skip steps; uses CUDA graph on GPU, direct stepping on CPU)
+        if self._graph is not None:
+            wp.capture_launch(self._graph)
+        else:
+            for _ in range(self._frame_skip):
+                mjw.step(self._mjw_model, self._mjw_data)
         wp.synchronize()
 
         self._step_count += 1
@@ -507,8 +507,10 @@ class RocketLanderWarp(EnvBase):
 if __name__ == "__main__":
     import time
 
+    num_envs = 64
+    device = "cpu"
     print("Testing RocketLanderWarp...")
-    env = RocketLanderWarp(num_envs=4096, device="cuda", rocket_design="v0")
+    env = RocketLanderWarp(num_envs=num_envs, device=device, rocket_design="v0")
     print(f"  Created {env._num_envs} environments on {env._device}")
     print(f"  observation_spec: {env.observation_spec}")
     print(f"  action_spec: {env.action_spec}")
@@ -517,26 +519,23 @@ if __name__ == "__main__":
     print(f"  Reset obs shape: {td['observation'].shape}")
 
     # Benchmark
-    n_steps = 200
-    actions = torch.rand(4096, 3, device="cuda") * 2 - 1
+    n_steps = 50
+    actions = torch.rand(num_envs, 3, device=device) * 2 - 1
     actions[:, 2] = actions[:, 2].abs()  # thrust_z >= 0
 
     # Warmup
-    for _ in range(10):
+    for _ in range(5):
         td["action"] = actions
         td = env.step(td)
 
-    torch.cuda.synchronize()
     t0 = time.time()
     for _ in range(n_steps):
         td["action"] = actions
         td = env.step(td)
-    torch.cuda.synchronize()
     elapsed = time.time() - t0
 
-    total_steps = n_steps * 4096
+    total_steps = n_steps * num_envs
     sps = total_steps / elapsed
-    print(f"\n  Benchmark: {n_steps} steps x {4096} envs = {total_steps} total steps")
+    print(f"\n  Benchmark: {n_steps} steps x {num_envs} envs = {total_steps} total steps")
     print(f"  Time: {elapsed:.2f}s")
     print(f"  Throughput: {sps:,.0f} steps/sec")
-    print(f"  Speedup vs current (~120 sps): {sps / 120:.0f}x")
