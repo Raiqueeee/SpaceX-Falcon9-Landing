@@ -106,7 +106,7 @@ Terminal: **+2000 · exp(−approach_vel)** on success · **−10** on crash or 
 Requires Python 3.10+. Runs entirely on CPU.
 
 ```bash
-git clone https://github.com/BY571/SpaceX-Falcon9.git
+git clone https://github.com/Raiqueeee/SpaceX-Falcon9-Landing.git
 cd SpaceX-Falcon9
 uv sync
 ```
